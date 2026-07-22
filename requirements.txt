@@ -1,0 +1,17 @@
+streamlit>=1.28.0,<2.0
+pandas>=2.0.0,<3.0
+numpy>=1.24.0,<2.0
+yfinance>=0.2.66
+plotly>=5.18.0,<6.0
+requests>=2.31.0,<3.0
+pytz>=2023.3
+scipy>=1.10.0,<2.0
+breeze-connect>=1.0.40
+supabase>=2.3.0
+postgrest>=0.13.0
+gotrue>=2.0.0
+
+# AI — Claude only (replaces openai + google-generativeai)
+anthropic>=0.40.0
+
+# v3.1 patch 2026-06-13 — Breeze timeout, intraday cache, progress bars
