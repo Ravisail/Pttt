@@ -154,7 +154,8 @@ def download_data(symbols: tuple[str, ...], start_iso: str, end_iso: str) -> dic
                 raw.columns = raw.columns.get_level_values(0)
             if "Close" not in raw.columns:
                 return sym, None
-            out = raw[["Close"]].dropna().copy()
+            keep = [c for c in ["Open", "High", "Low", "Close"] if c in raw.columns]
+            out = raw[keep].dropna().copy()
             out.index = pd.to_datetime(out.index).tz_localize(None)
             return sym, out
         except Exception:
@@ -171,30 +172,52 @@ def download_data(symbols: tuple[str, ...], start_iso: str, end_iso: str) -> dic
 # --------------------------------------------------------------------------- #
 # Exit logic (spec left this open; configurable rules with swing defaults)
 # --------------------------------------------------------------------------- #
-def compute_exit(closes, e10, e21, buy_pos, target_pct, stop_pct, max_hold, use_ema_exit):
+def compute_exit(opens, highs, lows, closes, e10, e21, buy_pos,
+                 target_pct, stop_pct, max_hold, use_ema_exit):
     """
-    Forward-scan from the bar after entry and return (exit_pos, exit_price, reason)
-    using close-based rules only (consistent with 'close only' + no intrabar peeking).
-    Priority per bar: Stop -> Target -> EMA10<EMA21 -> Max-Holding.
-    Falls back to marking-to-market at the last available bar ('Open (End)').
+    Forward-scan from the bar after entry and return (exit_pos, exit_price, reason).
+
+    Price-level exits fill AT the level, not at the breaching close, so realized
+    results respect the configured target/stop %s:
+      * Target  -> fill at entry*(1+target%); if the bar GAPS open above it, fill
+                   at the open (you cannot get filled better than the open).
+      * Stop    -> fill at entry*(1-stop%); if the bar GAPS open below it, fill at
+                   the open (a stop cannot protect against an overnight gap — that
+                   slippage is real, not a bug).
+    Within one bar the stop is assumed hit before the target (conservative). EMA
+    and max-holding exits are not price levels, so they fill at that bar's close.
+    Uses only current-bar OHLC -> no look-ahead. Falls back to 'Open (End)'.
     """
     n = len(closes)
     entry = closes[buy_pos]
+    target_price = entry * (1.0 + target_pct / 100.0)
+    stop_price = entry * (1.0 - stop_pct / 100.0)
+
     for j in range(buy_pos + 1, n):
-        c = closes[j]
+        o, h, l, c = opens[j], highs[j], lows[j], closes[j]
         if np.isnan(c):
             continue
-        ret = (c - entry) / entry
         hold = j - buy_pos
-        if stop_pct > 0 and ret <= -stop_pct / 100.0:
-            return j, c, "Stop Loss"
-        if target_pct > 0 and ret >= target_pct / 100.0:
-            return j, c, "Target"
+
+        # 1) Opening gaps straight through a level -> realistic fill at the open.
+        if stop_pct > 0 and o <= stop_price:
+            return j, float(o), "Stop Loss (gap)"
+        if target_pct > 0 and o >= target_price:
+            return j, float(o), "Target (gap)"
+
+        # 2) Intrabar touch -> fill exactly at the level (stop prioritized).
+        if stop_pct > 0 and l <= stop_price:
+            return j, float(stop_price), "Stop Loss"
+        if target_pct > 0 and h >= target_price:
+            return j, float(target_price), "Target"
+
+        # 3) Non-level exits fill at the bar close.
         if use_ema_exit and not np.isnan(e10[j]) and not np.isnan(e21[j]) and e10[j] < e21[j]:
-            return j, c, "EMA10<EMA21"
+            return j, float(c), "EMA10<EMA21"
         if max_hold > 0 and hold >= max_hold:
-            return j, c, "Max Holding"
-    return n - 1, closes[n - 1], "Open (End)"
+            return j, float(c), "Max Holding"
+
+    return n - 1, float(closes[n - 1]), "Open (End)"
 
 
 # --------------------------------------------------------------------------- #
@@ -210,6 +233,9 @@ def scan_stock(symbol, df, exit_cfg):
     """
     idx = df.index
     closes = df["Close"].values
+    opens = df["Open"].values if "Open" in df.columns else closes
+    highs = df["High"].values if "High" in df.columns else closes
+    lows = df["Low"].values if "Low" in df.columns else closes
     e10 = df["EMA10"].values
     e21 = df["EMA21"].values
     e50 = df["EMA50"].values
@@ -271,7 +297,7 @@ def scan_stock(symbol, df, exit_cfg):
                 buy_pos = i                      # completion bar = final crossover bar
                 buy_price = float(closes[buy_pos])
                 ex_pos, ex_price, ex_reason = compute_exit(
-                    closes, e10, e21, buy_pos, *exit_cfg
+                    opens, highs, lows, closes, e10, e21, buy_pos, *exit_cfg
                 )
                 rec.update({
                     "buy_pos": buy_pos,
