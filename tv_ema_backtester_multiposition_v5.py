@@ -8,6 +8,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+import io
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -242,44 +243,429 @@ def generate_signals(df: pd.DataFrame, ema_length: int) -> pd.DataFrame:
 
 
 # ===================================================================
+# ANALYTICS & ENTRY FILTERS MODULE
+# ===================================================================
+#
+# Purely additive, read-only diagnostics computed ONCE per symbol from
+# the already-generated 'signal' column above -- NEVER recalculates or
+# alters BUY/SELL signals, EMA High/Low/Close, or any STRATEGY MODULE
+# value. Entry Filters here only ever decide whether a BUY signal that
+# has already fired is actually taken by the BACKTESTING MODULE; they
+# can never create, remove, or move a signal, and they never touch
+# SELL signals/exits at all.
+# ===================================================================
+
+def _rsi(series: pd.Series, length: int = 14) -> pd.Series:
+    """Standard Wilder RSI. Pure analytics -- not part of the strategy."""
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / length, min_periods=length, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / length, min_periods=length, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    rsi = rsi.where(avg_loss != 0, 100.0)
+    return rsi
+
+
+def _atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
+    """Standard Average True Range (Wilder smoothing). Pure analytics."""
+    prev_close = df['Close'].shift(1)
+    tr = pd.concat([
+        df['High'] - df['Low'],
+        (df['High'] - prev_close).abs(),
+        (df['Low'] - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / length, min_periods=length, adjust=False).mean()
+
+
+def _r2(val):
+    """Round to 2 decimals, passing through None/NaN untouched (analytics
+    snapshot values can be missing during warm-up)."""
+    if val is None or (isinstance(val, float) and np.isnan(val)):
+        return None
+    return round(float(val), 2)
+
+
+def _r4(val):
+    """Round to 4 decimals, passing through None/NaN untouched."""
+    if val is None or (isinstance(val, float) and np.isnan(val)):
+        return None
+    return round(float(val), 4)
+
+
+def compute_analytics(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add every diagnostic column the Enhanced Trade Log / Entry Filters
+    need, computed ONCE per symbol over the full (warm-up-included)
+    dataset so nothing is ever recalculated later in the pipeline.
+    Read-only with respect to 'signal', 'ema_high', 'ema_low',
+    'ema_close' -- those already exist from generate_signals() above
+    and are never overwritten here.
+    """
+    df = df.copy()
+
+    # --- Extra EMAs (analytics only; the strategy's own ema_high/
+    # ema_low/ema_close are untouched) ---
+    df['ema21'] = df['Close'].ewm(span=21, adjust=False).mean()
+    df['ema50'] = df['Close'].ewm(span=50, adjust=False).mean()
+    df['ema200'] = df['Close'].ewm(span=200, adjust=False).mean()
+
+    # --- EMA Channel Width % and distances ---
+    df['ema_channel_width_pct'] = ((df['ema_high'] - df['ema_low']) / df['Close']) * 100
+    df['dist_close_ema21_pct'] = ((df['Close'] - df['ema21']) / df['ema21']) * 100
+    df['dist_close_ema50_pct'] = ((df['Close'] - df['ema50']) / df['ema50']) * 100
+    df['dist_close_ema200_pct'] = ((df['Close'] - df['ema200']) / df['ema200']) * 100
+
+    # --- Candle geometry ---
+    rng = (df['High'] - df['Low']).replace(0, np.nan)
+    df['candle_range_pct'] = (df['High'] - df['Low']) / df['Close'] * 100
+    df['candle_body'] = (df['Close'] - df['Open']).abs()
+    df['candle_color'] = np.where(df['Close'] > df['Open'], 'Green',
+                            np.where(df['Close'] < df['Open'], 'Red', 'Doji'))
+    df['upper_wick'] = df['High'] - df[['Open', 'Close']].max(axis=1)
+    df['lower_wick'] = df[['Open', 'Close']].min(axis=1) - df['Low']
+    df['upper_wick_ratio'] = (df['upper_wick'] / rng).fillna(0.0)
+    df['lower_wick_ratio'] = (df['lower_wick'] / rng).fillna(0.0)
+    df['close_position_in_candle_pct'] = ((df['Close'] - df['Low']) / rng * 100).fillna(50.0)
+    df['open_position_in_candle_pct'] = ((df['Open'] - df['Low']) / rng * 100).fillna(50.0)
+
+    # --- Gap analysis (vs. previous trading day's High/Low) ---
+    prev_high = df['High'].shift(1)
+    prev_low = df['Low'].shift(1)
+    gap_up_pct = (df['Open'] - prev_high) / prev_high * 100
+    gap_down_pct = (prev_low - df['Open']) / prev_low * 100
+    # Signed "the day's gap": positive = gap up, negative = gap down
+    df['gap_pct'] = np.where(gap_up_pct > 0, gap_up_pct, np.where(gap_down_pct > 0, -gap_down_pct, 0.0))
+    df['prev_day_gap_pct'] = df['gap_pct'].shift(1)
+    df['gap_2d_ago_pct'] = df['gap_pct'].shift(2)
+    df['gap_3d_ago_pct'] = df['gap_pct'].shift(3)
+    # Next day's gap (used by the Next Day Entry Gap Filter): gap of the
+    # NEXT trading day's Open (or Close) vs. TODAY's Close. Both bases are
+    # computed here so the filter can match whichever Entry Type basis is
+    # selected -- 'next_day_gap_pct' (the one actually used) is set to the
+    # matching one inside evaluate_entry_filters(), based on settings.
+    next_open = df['Open'].shift(-1)
+    next_close = df['Close'].shift(-1)
+    df['next_day_gap_open_pct'] = (next_open - df['Close']) / df['Close'] * 100
+    df['next_day_gap_close_pct'] = (next_close - df['Close']) / df['Close'] * 100
+    df['next_day_gap_pct'] = df['next_day_gap_open_pct']  # default basis; may be overridden by filter settings
+
+    # --- Volume & momentum ---
+    if 'Volume' in df.columns:
+        df['avg_volume_20'] = df['Volume'].rolling(20, min_periods=1).mean()
+        df['volume_ratio'] = df['Volume'] / df['avg_volume_20'].replace(0, np.nan)
+    else:
+        df['Volume'] = np.nan
+        df['avg_volume_20'] = np.nan
+        df['volume_ratio'] = np.nan
+    df['rsi'] = _rsi(df['Close'], 14)
+    df['atr'] = _atr(df, 14)
+    df['atr_pct'] = df['atr'] / df['Close'] * 100
+    df['highest_close_30d'] = df['Close'].rolling(30, min_periods=1).max()
+    df['lowest_close_30d'] = df['Close'].rolling(30, min_periods=1).min()
+    df['dist_from_30d_high_pct'] = (df['Close'] - df['highest_close_30d']) / df['highest_close_30d'] * 100
+    df['dist_from_30d_low_pct'] = (df['Close'] - df['lowest_close_30d']) / df['lowest_close_30d'] * 100
+
+    return df
+
+
+DEFAULT_FILTER_SETTINGS = {
+    'ema_width_enabled': False, 'ema_width_min': 1.0, 'ema_width_max': 2.0,
+    'body_ratio_enabled': False, 'body_ratio_min': 0.70, 'body_ratio_max': 0.80,
+    'candle_range_enabled': False, 'candle_range_max': 4.0,
+    'prev_gap_enabled': False, 'prev_gap_lookback': 3, 'prev_gap_up_max': 2.0, 'prev_gap_down_max': 2.0,
+    'next_gap_enabled': False, 'next_gap_up_max': 1.0, 'entry_type': 'Next Day Open',
+}
+
+
+def evaluate_entry_filters(df: pd.DataFrame, settings: dict = None) -> pd.DataFrame:
+    """
+    Evaluate every configured Entry Filter for each BUY signal row, once,
+    and store the pass/fail result plus a combined 'final_entry_approved'
+    + 'rejection_reason' -- consumed later by build_trigger_events() to
+    decide whether a BUY signal is actually taken. Never touches the
+    'signal' column itself, and never evaluates filters for SELL rows
+    (filters are entry-only, per spec).
+    """
+    settings = {**DEFAULT_FILTER_SETTINGS, **(settings or {})}
+    df = df.copy()
+    n = len(df)
+
+    ema_pass = pd.Series(True, index=df.index)
+    body_pass = pd.Series(True, index=df.index)
+    range_pass = pd.Series(True, index=df.index)
+    prev_gap_pass = pd.Series(True, index=df.index)
+    next_gap_pass = pd.Series(True, index=df.index)
+    df['max_gap_in_lookback_pct'] = 0.0
+
+    if settings['ema_width_enabled']:
+        ema_pass = df['ema_channel_width_pct'].between(settings['ema_width_min'], settings['ema_width_max'])
+
+    if settings['body_ratio_enabled']:
+        body_pass = df['body_ratio'].between(settings['body_ratio_min'], settings['body_ratio_max'])
+
+    if settings['candle_range_enabled']:
+        range_pass = df['candle_range_pct'] <= settings['candle_range_max']
+
+    if settings['prev_gap_enabled']:
+        lookback = int(settings['prev_gap_lookback'])
+        gap_cols = [df['gap_pct'].shift(k) for k in range(1, lookback + 1)]
+        gap_window = pd.concat(gap_cols, axis=1) if gap_cols else pd.DataFrame(index=df.index)
+        max_abs_gap = gap_window.abs().max(axis=1).fillna(0.0)
+        df['max_gap_in_lookback_pct'] = max_abs_gap
+        gap_up_ok = gap_window.where(gap_window > 0).max(axis=1).fillna(0.0) <= settings['prev_gap_up_max']
+        gap_down_ok = gap_window.where(gap_window < 0).min(axis=1).fillna(0.0).abs() <= settings['prev_gap_down_max']
+        prev_gap_pass = gap_up_ok & gap_down_ok
+
+    if settings['next_gap_enabled']:
+        # Match the gap check to whichever price the trade will actually
+        # enter at: 'Next Day Close' entry uses the Close-basis gap,
+        # otherwise (default) the Open-basis gap is used.
+        if settings.get('entry_type') == 'Next Day Close':
+            df['next_day_gap_pct'] = df['next_day_gap_close_pct']
+        else:
+            df['next_day_gap_pct'] = df['next_day_gap_open_pct']
+        next_gap_pass = df['next_day_gap_pct'] <= settings['next_gap_up_max']
+
+    df['ema_width_filter_passed'] = ema_pass
+    df['body_ratio_filter_passed'] = body_pass
+    df['candle_range_filter_passed'] = range_pass
+    df['previous_gap_filter_passed'] = prev_gap_pass
+    df['next_day_gap_filter_passed'] = next_gap_pass
+
+    final_approved = ema_pass & body_pass & range_pass & prev_gap_pass & next_gap_pass
+    df['final_entry_approved'] = final_approved
+
+    reasons = pd.Series('', index=df.index, dtype=object)
+    reason_map = [
+        (~ema_pass, 'EMA Channel Width'),
+        (~body_pass, 'Body Ratio'),
+        (~range_pass, 'Candle Range'),
+        (~prev_gap_pass, 'Previous Gap'),
+        (~next_gap_pass, 'Next Day Gap'),
+    ]
+    for failed_mask, label in reason_map:
+        reasons = np.where(failed_mask & (reasons == ''), label, reasons)
+    df['rejection_reason'] = reasons
+    return df
+
+
+def extract_signal_snapshot(symbol: str, signal_date, row: pd.Series) -> dict:
+    """
+    Build one full analytics snapshot dict for a single signal row (BUY or
+    SELL, approved or rejected). Shared by the Scanner Results export and
+    the Rejected Signals Log so both carry the same diagnostic detail as
+    the Enhanced Trade Log, without requiring the signal to have become an
+    executed trade. Computed by simply reading already-computed columns --
+    nothing here is recalculated.
+    """
+    def g(col):
+        if col not in row.index:
+            return None
+        val = row[col]
+        if isinstance(val, float) and np.isnan(val):
+            return None
+        return val
+
+    return {
+        'symbol': symbol,
+        'signal': g('signal'),
+        'signal_date': signal_date,
+        'open': _r4(g('Open')), 'high': _r4(g('High')), 'low': _r4(g('Low')), 'close': _r4(g('Close')),
+        'candle_color': g('candle_color'),
+        'candle_range_pct': _r2(g('candle_range_pct')),
+        'candle_body': _r4(g('candle_body')),
+        'candle_body_ratio': _r4(g('body_ratio')),
+        'upper_wick': _r4(g('upper_wick')), 'upper_wick_ratio': _r4(g('upper_wick_ratio')),
+        'lower_wick': _r4(g('lower_wick')), 'lower_wick_ratio': _r4(g('lower_wick_ratio')),
+        'close_position_in_candle_pct': _r2(g('close_position_in_candle_pct')),
+        'open_position_in_candle_pct': _r2(g('open_position_in_candle_pct')),
+        'ema_high': _r4(g('ema_high')), 'ema_low': _r4(g('ema_low')), 'ema_close': _r4(g('ema_close')),
+        'ema21': _r4(g('ema21')), 'ema50': _r4(g('ema50')), 'ema200': _r4(g('ema200')),
+        'ema_channel_width_pct': _r2(g('ema_channel_width_pct')),
+        'dist_close_ema21_pct': _r2(g('dist_close_ema21_pct')),
+        'dist_close_ema50_pct': _r2(g('dist_close_ema50_pct')),
+        'dist_close_ema200_pct': _r2(g('dist_close_ema200_pct')),
+        'previous_day_gap_pct': _r2(g('prev_day_gap_pct')),
+        'gap_2d_ago_pct': _r2(g('gap_2d_ago_pct')),
+        'gap_3d_ago_pct': _r2(g('gap_3d_ago_pct')),
+        'max_gap_in_lookback_pct': _r2(g('max_gap_in_lookback_pct')),
+        'next_day_gap_pct': _r2(g('next_day_gap_pct')),
+        'next_day_gap_open_pct': _r2(g('next_day_gap_open_pct')),
+        'next_day_gap_close_pct': _r2(g('next_day_gap_close_pct')),
+        'volume': g('Volume'), 'avg_volume_20': _r2(g('avg_volume_20')), 'volume_ratio': _r2(g('volume_ratio')),
+        'rsi': _r2(g('rsi')), 'atr': _r4(g('atr')), 'atr_pct': _r2(g('atr_pct')),
+        'highest_close_30d': _r4(g('highest_close_30d')), 'lowest_close_30d': _r4(g('lowest_close_30d')),
+        'dist_from_30d_high_pct': _r2(g('dist_from_30d_high_pct')), 'dist_from_30d_low_pct': _r2(g('dist_from_30d_low_pct')),
+        'ema_width_filter_passed': g('ema_width_filter_passed'),
+        'body_ratio_filter_passed': g('body_ratio_filter_passed'),
+        'candle_range_filter_passed': g('candle_range_filter_passed'),
+        'previous_gap_filter_passed': g('previous_gap_filter_passed'),
+        'next_day_gap_filter_passed': g('next_day_gap_filter_passed'),
+        'final_entry_approved': g('final_entry_approved'),
+        'rejection_reason': g('rejection_reason'),
+    }
+
+
+def compute_filter_statistics(buy_signal_rows: list) -> dict:
+    """
+    Aggregate filter-wise pass/fail counts across every BUY signal seen
+    during the scan (both approved and rejected), for the Filter
+    Statistics dashboard. `buy_signal_rows` is a list of the same dicts
+    produced by extract_signal_snapshot() for signal == 'BUY' rows.
+    """
+    total = len(buy_signal_rows)
+    if total == 0:
+        return {
+            'Total BUY Signals': 0,
+            'Rejected by EMA Width Filter': 0,
+            'Rejected by Body Ratio Filter': 0,
+            'Rejected by Candle Range Filter': 0,
+            'Rejected by Previous Gap Filter': 0,
+            'Rejected by Next Day Gap Filter': 0,
+            'Final Approved': 0,
+            'Approval Rate %': 0.0,
+        }
+
+    def count_failed(key):
+        return sum(1 for r in buy_signal_rows if r.get(key) is False)
+
+    approved = sum(1 for r in buy_signal_rows if r.get('final_entry_approved') is True)
+    return {
+        'Total BUY Signals': total,
+        'Rejected by EMA Width Filter': count_failed('ema_width_filter_passed'),
+        'Rejected by Body Ratio Filter': count_failed('body_ratio_filter_passed'),
+        'Rejected by Candle Range Filter': count_failed('candle_range_filter_passed'),
+        'Rejected by Previous Gap Filter': count_failed('previous_gap_filter_passed'),
+        'Rejected by Next Day Gap Filter': count_failed('next_day_gap_filter_passed'),
+        'Final Approved': approved,
+        'Approval Rate %': round(approved / total * 100, 2),
+    }
+
+
+def build_optimization_bucket_table(trades_df: pd.DataFrame, value_col: str, n_bins: int = 5) -> pd.DataFrame:
+    """
+    Bucket completed trades by one analytics value (e.g. EMA Channel Width
+    % at entry) into up to n_bins quantile ranges and report trade count,
+    win rate %, and average return % per bucket -- the "X vs Win Rate"
+    optimization report tables. Only executed trades have a win/loss
+    outcome, so this is necessarily built from trades_df, not the full
+    signal/rejected-signal universe.
+    """
+    if trades_df.empty or value_col not in trades_df.columns:
+        return pd.DataFrame()
+    d = trades_df[[value_col, 'pnl_pct', 'win_loss']].dropna(subset=[value_col])
+    if d.empty:
+        return pd.DataFrame()
+    try:
+        d = d.assign(bucket=pd.qcut(d[value_col], q=min(n_bins, d[value_col].nunique()), duplicates='drop'))
+    except (ValueError, IndexError):
+        d = d.assign(bucket=pd.cut(d[value_col], bins=min(n_bins, max(d[value_col].nunique(), 1))))
+    grouped = d.groupby('bucket', observed=True).agg(
+        Trade_Count=('pnl_pct', 'count'),
+        Win_Rate_Pct=('win_loss', lambda s: round((s == 'Win').mean() * 100, 2)),
+        Avg_Return_Pct=('pnl_pct', lambda s: round(s.mean(), 2)),
+    ).reset_index()
+    grouped['bucket'] = grouped['bucket'].astype(str)
+    grouped = grouped.rename(columns={
+        'bucket': 'Range', 'Trade_Count': 'Trade Count',
+        'Win_Rate_Pct': 'Win Rate %', 'Avg_Return_Pct': 'Avg Return %',
+    })
+    return grouped
+
+
+# ===================================================================
 # BACKTESTING MODULE
 # ===================================================================
 #
 # This module NEVER recalculates or alters BUY/SELL signals. It only
 # consumes the 'signal' column already produced by generate_signals()
-# (STRATEGY MODULE above). All capital management, trade execution,
-# and single-position-at-a-time rules live here.
+# (STRATEGY MODULE above), plus the read-only diagnostics from the
+# ANALYTICS & ENTRY FILTERS MODULE. All capital management, trade
+# execution, per-symbol position tracking, and optional entry-filter /
+# stop-loss / target overlays live here.
 #
-# Architecture: one shared capital pool and at most ONE open position
-# across the ENTIRE scanned universe at any point in time. Signals
-# from every symbol are merged into a single stream of next-day
-# trigger events and executed in strict chronological order.
+# Architecture: one shared capital pool, multiple independent
+# per-symbol open positions (bounded by Maximum Concurrent Positions).
+# Signals from every symbol are merged into a single stream of
+# executable trigger events and executed in strict chronological order.
 # ===================================================================
 
-def build_trigger_events(symbol_data: dict) -> list:
+ANALYTICS_SNAPSHOT_COLUMNS = [
+    'ema_high', 'ema_low', 'ema_close', 'ema21', 'ema50', 'ema200',
+    'ema_channel_width_pct', 'dist_close_ema21_pct', 'dist_close_ema50_pct', 'dist_close_ema200_pct',
+    'Open', 'High', 'Low', 'Close', 'candle_color', 'candle_range_pct', 'candle_body', 'body_ratio',
+    'upper_wick', 'upper_wick_ratio', 'lower_wick', 'lower_wick_ratio',
+    'close_position_in_candle_pct', 'open_position_in_candle_pct',
+    'prev_day_gap_pct', 'gap_2d_ago_pct', 'gap_3d_ago_pct', 'max_gap_in_lookback_pct',
+    'next_day_gap_pct', 'next_day_gap_open_pct', 'next_day_gap_close_pct',
+    'previous_gap_filter_passed', 'next_day_gap_filter_passed',
+    'ema_width_filter_passed', 'body_ratio_filter_passed', 'candle_range_filter_passed',
+    'final_entry_approved', 'rejection_reason',
+    'Volume', 'avg_volume_20', 'volume_ratio', 'rsi', 'atr', 'atr_pct',
+    'highest_close_30d', 'lowest_close_30d', 'dist_from_30d_high_pct', 'dist_from_30d_low_pct',
+]
+
+
+def build_trigger_events(symbol_data: dict, entry_type: str = 'Next Day Open') -> list:
     """
     Convert each symbol's pre-generated 'signal' column into executable
     next-day trigger events. A signal on day i becomes actionable at day
-    i+1's Open (that symbol's own next trading day) -- signals are read
-    exactly as produced; nothing here re-derives or changes them.
+    i+1 (that symbol's own next trading day) -- signals are read exactly
+    as produced; nothing here re-derives or changes them.
+
+    Entry Filters (ANALYTICS & ENTRY FILTERS MODULE, evaluated once per
+    symbol beforehand) gate BUY events only: a BUY signal whose row has
+    'final_entry_approved' == False produces NO event at all -- the
+    trade is permanently skipped, exactly as if the signal never fired,
+    and (per the Next Day Entry Gap Filter spec) is never retried on a
+    later day. SELL signals are never filtered and always produce an
+    event.
+
+    `entry_type` controls only the BUY fill price basis: 'Next Day Open'
+    (default, matches the original engine) or 'Next Day Close'. SELL
+    exits triggered here always use next-day Open, unchanged from the
+    original engine.
 
     A signal on a symbol's LAST available row has no next day to execute
     on within the downloaded data, so it produces no event (consistent
     with only acting on data that actually exists).
     """
+    use_close_entry = (entry_type == 'Next Day Close')
     events = []
     for symbol, df in symbol_data.items():
         n = len(df)
+        has_analytics = 'final_entry_approved' in df.columns
         for i in range(n - 1):
             sig = df['signal'].iloc[i]
-            if pd.notna(sig):
-                events.append({
-                    'symbol': symbol,
-                    'action': sig,  # 'BUY' or 'SELL', exactly as generated
-                    'signal_date': df.index[i],
-                    'trigger_date': df.index[i + 1],
-                    'trigger_open': float(df['Open'].iloc[i + 1]),
-                })
+            if pd.isna(sig):
+                continue
+
+            if sig == 'BUY' and has_analytics and not bool(df['final_entry_approved'].iloc[i]):
+                continue  # entry filter rejected this signal -> skip permanently, no event
+
+            trigger_row = df.iloc[i + 1]
+            if sig == 'BUY':
+                trigger_price = float(trigger_row['Close']) if use_close_entry else float(trigger_row['Open'])
+            else:
+                trigger_price = float(trigger_row['Open'])  # SELL exits unchanged: next-day Open
+
+            event = {
+                'symbol': symbol,
+                'action': sig,  # 'BUY' or 'SELL', exactly as generated
+                'signal_date': df.index[i],
+                'trigger_date': df.index[i + 1],
+                'trigger_open': trigger_price,
+            }
+            if sig == 'BUY' and has_analytics:
+                signal_row = df.iloc[i]
+                snapshot = {}
+                for col in ANALYTICS_SNAPSHOT_COLUMNS:
+                    if col in df.columns:
+                        snapshot[col] = signal_row[col]
+                event['analytics'] = snapshot
+            events.append(event)
 
     # Strict chronological order. Same-day ties across symbols are broken
     # deterministically by symbol name (daily bars carry no intraday
@@ -297,6 +683,8 @@ def run_portfolio_backtest(
     enable_target: bool = False,
     target_pct: float = 10.0,
     max_concurrent_positions: int = 10,
+    entry_type: str = 'Next Day Open',
+    transaction_cost_pct: float = 0.0,
 ) -> tuple:
     """
     True multi-position portfolio backtest across every scanned symbol,
@@ -312,12 +700,17 @@ def run_portfolio_backtest(
         max_concurrent_positions, enough cash is available, and the
         position size buys at least one share. Any failing condition
         skips only that one signal -- processing continues normally.
+        (Entry Filter rejections happen even earlier, in
+        build_trigger_events(), so a filtered-out BUY never reaches
+        this stage at all.)
       - Multiple symbols can open AND close positions on the same day.
       - Shares = floor(Position Size / Entry Price); required cash =
-        Shares x Entry Price; on exit, invested amount + P&L returns to
-        available cash immediately, reduces the open position count,
-        and can fund a new trade (into the freed slot) the same day
-        (checked in signal-date order).
+        Shares x Entry Price; on exit, invested amount + P&L (net of
+        optional transaction cost) returns to available cash
+        immediately, reduces the open position count, and can fund a
+        new trade (into the freed slot) the same day (checked in
+        signal-date order). `entry_type` controls whether the BUY fill
+        price is the next day's Open or Close (see build_trigger_events).
       - Optional Stop Loss / Target are backtest-only overlays and never
         touch the scanner's BUY/SELL signal generation:
           * Stop Loss price = Entry Price x (1 - stop_loss_pct/100);
@@ -332,14 +725,21 @@ def run_portfolio_backtest(
             signal land on the same day, the Stop Loss/Target wins and
             the SELL signal that day is simply ignored (position already
             closed). A newly-opened position's own entry-day Low/High
-            is not checked for Stop Loss/Target -- monitoring starts the
-            next trading day, avoiding same-candle entry/exit ambiguity.
+            is not checked for Stop Loss/Target, and MFE/MAE tracking
+            (below) likewise starts the following trading day -- both
+            avoid same-candle entry/exit ambiguity.
+      - While a position is open, its highest/lowest price reached and
+        running peak-to-trough drawdown are tracked daily (from the day
+        after entry) to populate MFE/MAE trade-log fields on exit.
       - A position still open when its symbol's data runs out is closed
         at that symbol's last available Close, exit reason "End of Data".
 
     Returns
     -------
-    trades_df : pd.DataFrame
+    trades_df : pd.DataFrame       (Enhanced Trade Log -- see
+                                     ANALYTICS_SNAPSHOT_COLUMNS /
+                                     close_position() below for the
+                                     full column set)
     equity_df : pd.DataFrame        (daily portfolio equity across the
                                       union of all symbols' trading dates)
     final_cash : float
@@ -348,13 +748,14 @@ def run_portfolio_backtest(
                                       compute_backtest_summary)
     """
     cash = float(initial_capital)
-    positions = {}  # symbol -> {signal_date, entry_date, entry_price, shares, invested_amount, stop_price, target_price}
+    positions = {}  # symbol -> entry snapshot + running MFE/MAE state
     trades = []
     equity_records = []
     concurrent_counts = []
     invested_amounts_daily = []
     skipped_position_limit = 0
     skipped_insufficient_cash = 0
+    trade_id_counter = 0
 
     empty_stats = {
         'max_concurrent_positions_setting': int(max_concurrent_positions),
@@ -370,7 +771,7 @@ def run_portfolio_backtest(
     if not symbol_data:
         return pd.DataFrame(), pd.DataFrame(columns=['date', 'equity']), float(cash), empty_stats
 
-    events = build_trigger_events(symbol_data)
+    events = build_trigger_events(symbol_data, entry_type=entry_type)
 
     # Master timeline = union of every scanned symbol's trading dates.
     all_dates = sorted(set().union(*[set(df.index) for df in symbol_data.values()]))
@@ -387,39 +788,132 @@ def run_portfolio_backtest(
     def close_position(symbol, exit_date, exit_price, exit_reason):
         nonlocal cash
         pos = positions.pop(symbol)
-        exit_value = pos['shares'] * exit_price
-        cash += exit_value
-        pnl = exit_value - pos['invested_amount']
+        gross_exit_value = pos['shares'] * exit_price
+        entry_cost = pos['invested_amount'] * (transaction_cost_pct / 100.0)
+        exit_cost = gross_exit_value * (transaction_cost_pct / 100.0)
+        transaction_cost = entry_cost + exit_cost
+        net_exit_value = gross_exit_value - exit_cost
+        cash += net_exit_value
+        pnl = net_exit_value - pos['invested_amount'] - entry_cost
         pnl_pct = (pnl / pos['invested_amount']) * 100 if pos['invested_amount'] != 0 else 0.0
         holding_days = (exit_date - pos['entry_date']).days
 
-        trades.append({
+        highest_price = pos['highest_price']
+        lowest_price = pos['lowest_price']
+        entry_price = pos['entry_price']
+        mfe_pct = (highest_price - entry_price) / entry_price * 100 if entry_price else 0.0
+        mae_pct = (entry_price - lowest_price) / entry_price * 100 if entry_price else 0.0
+
+        stop_price = pos['stop_price']
+        target_price = pos['target_price']
+        risk_reward_ratio = None
+        if enable_stop_loss and enable_target and stop_loss_pct:
+            risk_reward_ratio = round(target_pct / stop_loss_pct, 2)
+
+        a = pos['analytics']  # entry-day analytics snapshot (may be {})
+
+        trade = {
+            # --- Trade Information ---
+            'trade_id': pos['trade_id'],
             'symbol': symbol,
             'signal_date': pos['signal_date'],
             'entry_date': pos['entry_date'],
-            'entry_price': round(float(pos['entry_price']), 4),
+            'entry_price': round(float(entry_price), 4),
             'exit_date': exit_date,
             'exit_price': round(float(exit_price), 4),
-            'shares': int(pos['shares']),
-            'invested_amount': round(float(pos['invested_amount']), 2),
-            'exit_value': round(float(exit_value), 2),
+            'exit_reason': exit_reason,
+            'holding_days': int(holding_days),
             'pnl': round(float(pnl), 2),
             'pnl_pct': round(float(pnl_pct), 2),
-            'holding_days': int(holding_days),
-            'exit_reason': exit_reason,
-            'stop_price': round(float(pos['stop_price']), 4) if pos['stop_price'] is not None else None,
-            'target_price': round(float(pos['target_price']), 4) if pos['target_price'] is not None else None,
+            'win_loss': 'Win' if pnl > 0 else 'Loss',
+
+            # --- Position Information ---
+            'initial_capital': round(float(initial_capital), 2),
+            'available_capital': round(float(cash), 2),
+            'position_size': round(float(position_size), 2),
+            'shares': int(pos['shares']),
+            'invested_amount': round(float(pos['invested_amount']), 2),
+            'transaction_cost': round(float(transaction_cost), 2),
+            'max_open_positions': int(max_concurrent_positions),
+            'capital_utilization_pct': round(float(pos['capital_utilization_pct_at_entry']), 2),
+
+            # --- EMA Data (at signal candle) ---
+            'ema_high': _r4(a.get('ema_high')), 'ema_low': _r4(a.get('ema_low')), 'ema_close': _r4(a.get('ema_close')),
+            'ema21': _r4(a.get('ema21')), 'ema50': _r4(a.get('ema50')), 'ema200': _r4(a.get('ema200')),
+            'ema_channel_width_pct': _r2(a.get('ema_channel_width_pct')),
+            'dist_close_ema21_pct': _r2(a.get('dist_close_ema21_pct')),
+            'dist_close_ema50_pct': _r2(a.get('dist_close_ema50_pct')),
+            'dist_close_ema200_pct': _r2(a.get('dist_close_ema200_pct')),
+
+            # --- Candle Data (signal candle) ---
+            'open': _r4(a.get('Open')), 'high': _r4(a.get('High')), 'low': _r4(a.get('Low')), 'close': _r4(a.get('Close')),
+            'candle_color': a.get('candle_color'),
+            'candle_range_pct': _r2(a.get('candle_range_pct')),
+            'candle_body': _r4(a.get('candle_body')),
+            'candle_body_ratio': _r4(a.get('body_ratio')),
+            'upper_wick': _r4(a.get('upper_wick')), 'upper_wick_ratio': _r4(a.get('upper_wick_ratio')),
+            'lower_wick': _r4(a.get('lower_wick')), 'lower_wick_ratio': _r4(a.get('lower_wick_ratio')),
+            'close_position_in_candle_pct': _r2(a.get('close_position_in_candle_pct')),
+            'open_position_in_candle_pct': _r2(a.get('open_position_in_candle_pct')),
+
+            # --- Gap Analysis ---
+            'previous_day_gap_pct': _r2(a.get('prev_day_gap_pct')),
+            'gap_2d_ago_pct': _r2(a.get('gap_2d_ago_pct')),
+            'gap_3d_ago_pct': _r2(a.get('gap_3d_ago_pct')),
+            'max_gap_in_lookback_pct': _r2(a.get('max_gap_in_lookback_pct')),
+            'next_day_gap_pct': _r2(a.get('next_day_gap_pct')),
+            'next_day_gap_open_pct': _r2(a.get('next_day_gap_open_pct')),
+            'next_day_gap_close_pct': _r2(a.get('next_day_gap_close_pct')),
+
+            # --- Volume & Momentum ---
+            'volume': a.get('Volume'),
+            'avg_volume_20': _r2(a.get('avg_volume_20')),
+            'volume_ratio': _r2(a.get('volume_ratio')),
+            'rsi': _r2(a.get('rsi')),
+            'atr': _r4(a.get('atr')),
+            'atr_pct': _r2(a.get('atr_pct')),
+            'highest_close_30d': _r4(a.get('highest_close_30d')),
+            'lowest_close_30d': _r4(a.get('lowest_close_30d')),
+            'dist_from_30d_high_pct': _r2(a.get('dist_from_30d_high_pct')),
+            'dist_from_30d_low_pct': _r2(a.get('dist_from_30d_low_pct')),
+
+            # --- Filter Results ---
+            'ema_width_filter_passed': a.get('ema_width_filter_passed'),
+            'body_ratio_filter_passed': a.get('body_ratio_filter_passed'),
+            'candle_range_filter_passed': a.get('candle_range_filter_passed'),
+            'previous_gap_filter_passed': a.get('previous_gap_filter_passed'),
+            'next_day_gap_filter_passed': a.get('next_day_gap_filter_passed'),
+            'final_entry_approved': a.get('final_entry_approved', True),
+            'rejection_reason': a.get('rejection_reason', ''),
+
+            # --- Trade Management ---
+            'stop_loss_pct': stop_loss_pct if enable_stop_loss else None,
+            'stop_price': round(float(stop_price), 4) if stop_price is not None else None,
+            'target_pct': target_pct if enable_target else None,
+            'target_price': round(float(target_price), 4) if target_price is not None else None,
+            'risk_reward_ratio': risk_reward_ratio,
+            'highest_price_during_trade': round(float(highest_price), 4),
+            'lowest_price_during_trade': round(float(lowest_price), 4),
+            'mfe_pct': round(float(mfe_pct), 2),
+            'mae_pct': round(float(mae_pct), 2),
+            'highest_unrealized_profit_pct': round(float(mfe_pct), 2),
+            'max_drawdown_during_trade_pct': round(float(pos['max_drawdown_pct']), 2),
+
+            # kept for backward compatibility with earlier trade-log consumers
+            'exit_value': round(float(net_exit_value), 2),
             'trade_duration': int(holding_days),
             'available_cash_after_trade': round(float(cash), 2),
-        })
+        }
+        trades.append(trade)
 
     event_idx = 0
     n_events = len(events)
 
     for d in all_dates:
-        # --- 1) Stop Loss / Target checks for positions already open
-        #        (from a prior day), BEFORE today's signal events, so the
-        #        exit-priority (Stop Loss > Target > SELL signal) holds. ---
+        # --- 1) Stop Loss / Target checks + MFE/MAE tracking for
+        #        positions already open (from a prior day), BEFORE
+        #        today's signal events, so the exit-priority (Stop Loss
+        #        > Target > SELL signal) holds. ---
         for symbol in list(positions.keys()):
             df = symbol_data[symbol]
             if d not in df.index:
@@ -428,6 +922,13 @@ def run_portfolio_backtest(
             pos = positions[symbol]
             low = float(row['Low'])
             high = float(row['High'])
+
+            pos['highest_price'] = max(pos['highest_price'], high)
+            pos['lowest_price'] = min(pos['lowest_price'], low)
+            pos['running_peak'] = max(pos['running_peak'], high)
+            if pos['running_peak'] > 0:
+                drawdown_today = (pos['running_peak'] - low) / pos['running_peak'] * 100
+                pos['max_drawdown_pct'] = max(pos['max_drawdown_pct'], drawdown_today)
 
             hit_stop = enable_stop_loss and pos['stop_price'] is not None and low <= pos['stop_price']
             hit_target = enable_target and pos['target_price'] is not None and high >= pos['target_price']
@@ -442,7 +943,7 @@ def run_portfolio_backtest(
             ev = events[event_idx]
             event_idx += 1
             symbol = ev['symbol']
-            today_open = ev['trigger_open']
+            today_price = ev['trigger_open']
 
             if ev['action'] == 'BUY':
                 if symbol in positions:
@@ -450,30 +951,42 @@ def run_portfolio_backtest(
                 if len(positions) >= max_concurrent_positions:
                     skipped_position_limit += 1
                     continue  # at the concurrent-position cap -> skip only this signal
-                calc_shares = int(np.floor(position_size / today_open)) if today_open > 0 else 0
-                invested = calc_shares * today_open
+                calc_shares = int(np.floor(position_size / today_price)) if today_price > 0 else 0
+                invested = calc_shares * today_price
                 if calc_shares <= 0:
                     continue  # position size can't buy even one share -> skip this entry only
-                if cash < invested:
+                entry_cost = invested * (transaction_cost_pct / 100.0)
+                if cash < invested + entry_cost:
                     skipped_insufficient_cash += 1
                     continue  # insufficient cash -> skip this entry only
-                cash -= invested
-                stop_price = today_open * (1 - stop_loss_pct / 100.0) if enable_stop_loss else None
-                target_price = today_open * (1 + target_pct / 100.0) if enable_target else None
+                cash -= (invested + entry_cost)
+                trade_id_counter += 1
+                stop_price = today_price * (1 - stop_loss_pct / 100.0) if enable_stop_loss else None
+                target_price = today_price * (1 + target_pct / 100.0) if enable_target else None
+                invested_now = sum(p['invested_amount'] for p in positions.values()) + invested
                 positions[symbol] = {
+                    'trade_id': trade_id_counter,
                     'signal_date': ev['signal_date'],
                     'entry_date': ev['trigger_date'],
-                    'entry_price': today_open,
+                    'entry_price': today_price,
                     'shares': calc_shares,
                     'invested_amount': invested,
                     'stop_price': stop_price,
                     'target_price': target_price,
+                    'highest_price': today_price,
+                    'lowest_price': today_price,
+                    'running_peak': today_price,
+                    'max_drawdown_pct': 0.0,
+                    'capital_utilization_pct_at_entry': (
+                        (invested_now / initial_capital) * 100 if initial_capital else 0.0
+                    ),
+                    'analytics': ev.get('analytics', {}),
                 }
 
             elif ev['action'] == 'SELL':
                 if symbol not in positions:
                     continue  # no open position in this symbol (or already closed by Stop/Target today) -> ignore
-                close_position(symbol, d, today_open, 'SELL Signal')
+                close_position(symbol, d, today_price, 'SELL Signal')
 
         # --- 3) Force-close any position whose symbol's data ends today ---
         for symbol in list(positions.keys()):
@@ -902,7 +1415,8 @@ def download_all_symbols(symbols: list, download_start, end_date, cache: dict,
 # always captured, never raised, so one bad symbol never stops the scan.
 # ===================================================================
 
-def process_symbol_df(symbol: str, raw_df, ema_length: int, start_date, end_date) -> dict:
+def process_symbol_df(symbol: str, raw_df, ema_length: int, start_date, end_date,
+                       filter_settings: dict = None) -> dict:
     """
     Generate signals for one symbol from an already-downloaded raw OHLC
     DataFrame (fetched via download_all_symbols) and summarize its
@@ -942,6 +1456,13 @@ def process_symbol_df(symbol: str, raw_df, ema_length: int, start_date, end_date
         # Generate signals over the COMPLETE downloaded dataset, warm-up
         # bars included (STRATEGY MODULE -- untouched, never truncated).
         df = generate_signals(df, ema_length)
+
+        # Additive, read-only analytics + entry-filter evaluation, also
+        # computed ONCE over the complete dataset (so rolling windows /
+        # gap-lookbacks spanning the Start Date boundary are correct, and
+        # nothing is ever recalculated later in the pipeline).
+        df = compute_analytics(df)
+        df = evaluate_entry_filters(df, filter_settings)
 
         start_ts = pd.Timestamp(start_date)
         result['bars_before_start'] = int((df.index < start_ts).sum())
@@ -1016,11 +1537,76 @@ def main():
         target_pct = st.slider('Target %', min_value=1.0, max_value=50.0, value=10.0, step=0.5,
                                 disabled=not enable_target)
 
+        st.subheader('Entry Filter Settings (Backtest Only)')
+        st.caption('Every filter only decides whether an already-fired BUY signal is taken. Scanner BUY/SELL signals are never changed.')
+
+        enable_ema_width_filter = st.checkbox('Enable EMA Channel Width Filter', value=False)
+        ema_width_min, ema_width_max = st.slider(
+            'EMA Channel Width % (min, max)', min_value=0.50, max_value=5.00,
+            value=(1.0, 2.0), step=0.05, disabled=not enable_ema_width_filter,
+        )
+
+        enable_body_ratio_filter = st.checkbox('Enable Body Ratio Filter', value=False)
+        body_ratio_min, body_ratio_max = st.slider(
+            'Body Ratio (min, max)', min_value=0.50, max_value=1.00,
+            value=(0.70, 0.80), step=0.01, disabled=not enable_body_ratio_filter,
+        )
+
+        enable_candle_range_filter = st.checkbox('Enable Candle Range Filter', value=False)
+        candle_range_max = st.slider(
+            'Maximum Candle Range %', min_value=2.0, max_value=8.0, value=4.0, step=0.1,
+            disabled=not enable_candle_range_filter,
+        )
+
+        enable_prev_gap_filter = st.checkbox('Enable Previous Gap Filter', value=False)
+        prev_gap_lookback = st.slider(
+            'Lookback Days', min_value=1, max_value=10, value=3, step=1,
+            disabled=not enable_prev_gap_filter,
+        )
+        prev_gap_up_max = st.slider(
+            'Maximum Gap Up %', min_value=0.5, max_value=5.0, value=2.0, step=0.1,
+            disabled=not enable_prev_gap_filter,
+        )
+        prev_gap_down_max = st.slider(
+            'Maximum Gap Down %', min_value=0.5, max_value=5.0, value=2.0, step=0.1,
+            disabled=not enable_prev_gap_filter,
+        )
+
+        enable_next_gap_filter = st.checkbox('Enable Next Day Gap Filter', value=False)
+        next_gap_up_max = st.slider(
+            'Maximum Next Day Gap Up %', min_value=0.0, max_value=3.0, value=1.0, step=0.1,
+            disabled=not enable_next_gap_filter,
+        )
+        entry_type = st.selectbox(
+            'Entry Type', ['Next Day Open', 'Next Day Close'], index=0,
+            help=(
+                'Fill price basis for every BUY entry (independent of whether '
+                'the Next Day Gap Filter is enabled). When the Next Day Gap '
+                'Filter is on, its gap % check automatically uses this same '
+                'basis -- Next Day Open vs. signal Close, or Next Day Close '
+                'vs. signal Close.'
+            ),
+        )
+
+        filter_settings = {
+            'ema_width_enabled': enable_ema_width_filter, 'ema_width_min': ema_width_min, 'ema_width_max': ema_width_max,
+            'body_ratio_enabled': enable_body_ratio_filter, 'body_ratio_min': body_ratio_min, 'body_ratio_max': body_ratio_max,
+            'candle_range_enabled': enable_candle_range_filter, 'candle_range_max': candle_range_max,
+            'prev_gap_enabled': enable_prev_gap_filter, 'prev_gap_lookback': prev_gap_lookback,
+            'prev_gap_up_max': prev_gap_up_max, 'prev_gap_down_max': prev_gap_down_max,
+            'next_gap_enabled': enable_next_gap_filter, 'next_gap_up_max': next_gap_up_max,
+            'entry_type': entry_type,
+        }
+
         st.subheader('Portfolio Sizing')
         max_concurrent_positions = st.number_input(
             'Maximum Concurrent Positions',
             min_value=1, max_value=500, value=10, step=1,
             help='The backtester will never hold more than this many open trades at once, across all symbols.',
+        )
+        transaction_cost_pct = st.number_input(
+            'Transaction Cost % (per side)', min_value=0.0, max_value=5.0, value=0.0, step=0.01,
+            help='Applied to both entry and exit trade value; reduces available cash and net P&L accordingly.',
         )
 
         st.subheader('Stock Universe')
@@ -1086,6 +1672,8 @@ def main():
     progress_text = st.empty()
 
     all_scanner_rows = []
+    rejected_signal_rows = []  # BUY signals that fired but were rejected by an Entry Filter
+    buy_signal_snapshots = []  # every BUY signal's snapshot (approved + rejected), for Filter Statistics
     symbol_data = {}  # symbol -> in-range df with signals, fed into the portfolio engine
     failed_symbols = []
     warmup_notes = []  # symbols where fewer than WARMUP_MIN_BARS were available before Start Date
@@ -1127,7 +1715,7 @@ def main():
         # Signal generation for this one symbol from its pre-downloaded
         # data. Never raises -- any failure (bad ticker, no data, ...) is
         # captured in r['status'] so the scan always continues.
-        r = process_symbol_df(symbol, raw_data.get(symbol), ema_length, start_date, end_date)
+        r = process_symbol_df(symbol, raw_data.get(symbol), ema_length, start_date, end_date, filter_settings=filter_settings)
 
         if r['in_range_df'] is not None:
             success_count += 1
@@ -1136,21 +1724,18 @@ def main():
             if r['bars_before_start'] < WARMUP_MIN_BARS:
                 warmup_notes.append((symbol, r['bars_before_start']))
 
-            # Scanner rows -- same in-range signals the backtester will use
+            # Scanner rows -- same in-range signals the backtester will use,
+            # now carrying the full analytics snapshot (same detail as the
+            # Enhanced Trade Log) so signals can be analyzed even when they
+            # never become an executed trade.
             signal_df = r['in_range_df'][r['in_range_df']['signal'].notna()]
             for idx, row in signal_df.iterrows():
-                all_scanner_rows.append({
-                    'symbol': symbol,
-                    'signal': row['signal'],
-                    'signal_date': idx,
-                    'close': round(row['Close'], 4),
-                    'ema_high': round(row['ema_high'], 4),
-                    'ema_low': round(row['ema_low'], 4),
-                    'channel_height': round(row['channel_height'], 4),
-                    'candle_range': round(row['total_range'], 4),
-                    'body_size': round(row['body_size'], 4),
-                    'body_ratio': round(row['body_ratio'], 4),
-                })
+                snapshot = extract_signal_snapshot(symbol, idx, row)
+                all_scanner_rows.append(snapshot)
+                if snapshot['signal'] == 'BUY':
+                    buy_signal_snapshots.append(snapshot)
+                    if snapshot.get('final_entry_approved') is False:
+                        rejected_signal_rows.append(snapshot)
         else:
             failed_count += 1
             failed_symbols.append((symbol, r['status']))
@@ -1177,6 +1762,7 @@ def main():
         enable_stop_loss=enable_stop_loss, stop_loss_pct=stop_loss_pct,
         enable_target=enable_target, target_pct=target_pct,
         max_concurrent_positions=max_concurrent_positions,
+        entry_type=entry_type, transaction_cost_pct=transaction_cost_pct,
     )
     if combined_equity.empty:
         combined_equity = pd.DataFrame({'date': [pd.Timestamp(start_date)], 'equity': [float(initial_capital)]})
@@ -1243,10 +1829,38 @@ def main():
 
     st.divider()
 
+    st.subheader('🧮 Filter Statistics')
+    filter_stats = compute_filter_statistics(buy_signal_snapshots)
+    st.dataframe(pd.DataFrame([filter_stats]), use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    st.subheader('🚫 Rejected Signals Log')
+    st.caption('Every BUY signal that fired but was rejected by an Entry Filter, with its full analytics snapshot -- lets you compare accepted vs. rejected signals for optimization.')
+    if rejected_signal_rows:
+        rejected_df = pd.DataFrame(rejected_signal_rows)
+        st.dataframe(rejected_df, use_container_width=True, hide_index=True)
+
+        csv_rejected = rejected_df.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label='📥 Download Rejected Signals Log (CSV)',
+            data=csv_rejected,
+            file_name='rejected_signals_log.csv',
+            mime='text/csv',
+        )
+    else:
+        st.info('No BUY signals were rejected by an Entry Filter (or no Entry Filters are enabled).')
+
+    st.divider()
+
     st.subheader('📋 Backtest Trade Log')
     if not trades_df.empty:
-        # Display-friendly column labels (internal engine keys unchanged above)
-        display_trades = trades_df.rename(columns={
+        # Explicit friendly labels for the original columns (kept stable for
+        # anyone already relying on these names); every other column (the
+        # new Enhanced Trade Log fields) gets a generic Title Case label so
+        # nothing is ever silently dropped from the export.
+        known_labels = {
+            'trade_id': 'Trade ID',
             'symbol': 'Symbol',
             'signal_date': 'Signal Date',
             'entry_date': 'Entry Date',
@@ -1264,16 +1878,33 @@ def main():
             'target_price': 'Target Price',
             'trade_duration': 'Trade Duration',
             'available_cash_after_trade': 'Available Cash After Trade',
-        })
+        }
+        display_labels = {
+            col: known_labels.get(col, col.replace('_', ' ').replace('pct', '%').strip().title())
+            for col in trades_df.columns
+        }
+        display_trades = trades_df.rename(columns=display_labels)
         st.dataframe(display_trades, use_container_width=True, hide_index=True)
 
-        csv_trades = display_trades.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label='📥 Download Trade Log (CSV)',
-            data=csv_trades,
-            file_name='trade_log.csv',
-            mime='text/csv',
-        )
+        col_csv, col_xlsx = st.columns(2)
+        with col_csv:
+            csv_trades = display_trades.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label='📥 Download Trade Log (CSV)',
+                data=csv_trades,
+                file_name='trade_log.csv',
+                mime='text/csv',
+            )
+        with col_xlsx:
+            xlsx_buffer = io.BytesIO()
+            with pd.ExcelWriter(xlsx_buffer, engine='openpyxl') as writer:
+                display_trades.to_excel(writer, index=False, sheet_name='Trade Log')
+            st.download_button(
+                label='📥 Download Trade Log (Excel)',
+                data=xlsx_buffer.getvalue(),
+                file_name='trade_log.xlsx',
+                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            )
     else:
         st.warning('No trades executed.')
 
@@ -1296,6 +1927,28 @@ def main():
     fig = plot_equity_curve(combined_equity)
     if fig:
         st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+
+    st.subheader('🧪 Optimization Report')
+    st.caption('Executed-trade outcomes bucketed by each parameter, to help identify the best filter/setting ranges. Built only from completed trades (win/loss requires an exit).')
+    if not trades_df.empty:
+        opt_tables = [
+            ('EMA Width vs Win Rate', 'ema_channel_width_pct'),
+            ('Body Ratio vs Win Rate', 'candle_body_ratio'),
+            ('Candle Range vs Win Rate', 'candle_range_pct'),
+            ('Gap % vs Win Rate', 'previous_day_gap_pct'),
+            ('Holding Days vs Return', 'holding_days'),
+        ]
+        for title, col in opt_tables:
+            st.markdown(f'**{title}**')
+            table = build_optimization_bucket_table(trades_df, col)
+            if not table.empty:
+                st.dataframe(table, use_container_width=True, hide_index=True)
+            else:
+                st.caption('Not enough data to bucket (missing values or too few trades).')
+    else:
+        st.info('No completed trades to build an optimization report from.')
 
     if failed_symbols:
         with st.expander(f'⚠️ Failed Symbols ({len(failed_symbols)})'):
