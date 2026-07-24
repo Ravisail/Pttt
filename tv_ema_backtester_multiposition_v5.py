@@ -296,6 +296,7 @@ def run_portfolio_backtest(
     stop_loss_pct: float = 5.0,
     enable_target: bool = False,
     target_pct: float = 10.0,
+    max_concurrent_positions: int = 10,
 ) -> tuple:
     """
     True multi-position portfolio backtest across every scanned symbol,
@@ -304,16 +305,19 @@ def run_portfolio_backtest(
     Rules enforced here (capital management / trade execution only --
     no strategy logic; BUY/SELL signals come from the untouched
     STRATEGY MODULE and are never re-derived or altered):
-      - Every stock maintains its own independent open position; there
-        is NO restriction to a single open position for the portfolio.
-      - Every valid BUY signal is executed as long as enough cash is
-        available; entries are skipped only for insufficient cash (or
-        zero computed shares).
+      - Every stock maintains its own independent open position.
+      - Every valid BUY signal is executed as long as ALL of the
+        following hold: the stock has no open position already, the
+        number of currently open positions is below
+        max_concurrent_positions, enough cash is available, and the
+        position size buys at least one share. Any failing condition
+        skips only that one signal -- processing continues normally.
       - Multiple symbols can open AND close positions on the same day.
       - Shares = floor(Position Size / Entry Price); required cash =
         Shares x Entry Price; on exit, invested amount + P&L returns to
-        available cash immediately and can fund a new trade the same
-        day (checked in signal-date order).
+        available cash immediately, reduces the open position count,
+        and can fund a new trade (into the freed slot) the same day
+        (checked in signal-date order).
       - Optional Stop Loss / Target are backtest-only overlays and never
         touch the scanner's BUY/SELL signal generation:
           * Stop Loss price = Entry Price x (1 - stop_loss_pct/100);
@@ -339,8 +343,9 @@ def run_portfolio_backtest(
     equity_df : pd.DataFrame        (daily portfolio equity across the
                                       union of all symbols' trading dates)
     final_cash : float
-    portfolio_stats : dict          (concurrency / capital-utilization
-                                      stats used by compute_backtest_summary)
+    portfolio_stats : dict          (concurrency / capital-utilization /
+                                      skip-reason stats used by
+                                      compute_backtest_summary)
     """
     cash = float(initial_capital)
     positions = {}  # symbol -> {signal_date, entry_date, entry_price, shares, invested_amount, stop_price, target_price}
@@ -348,12 +353,18 @@ def run_portfolio_backtest(
     equity_records = []
     concurrent_counts = []
     invested_amounts_daily = []
+    skipped_position_limit = 0
+    skipped_insufficient_cash = 0
 
     empty_stats = {
-        'max_concurrent_positions': 0,
+        'max_concurrent_positions_setting': int(max_concurrent_positions),
+        'highest_concurrent_positions': 0,
         'avg_concurrent_positions': 0.0,
         'peak_capital_invested': 0.0,
         'avg_capital_invested': 0.0,
+        'position_slot_utilization_pct': 0.0,
+        'skipped_position_limit': 0,
+        'skipped_insufficient_cash': 0,
     }
 
     if not symbol_data:
@@ -436,10 +447,16 @@ def run_portfolio_backtest(
             if ev['action'] == 'BUY':
                 if symbol in positions:
                     continue  # this symbol already has an open position -> ignore
+                if len(positions) >= max_concurrent_positions:
+                    skipped_position_limit += 1
+                    continue  # at the concurrent-position cap -> skip only this signal
                 calc_shares = int(np.floor(position_size / today_open)) if today_open > 0 else 0
                 invested = calc_shares * today_open
-                if calc_shares <= 0 or cash < invested:
-                    continue  # zero shares or insufficient cash -> skip this entry only
+                if calc_shares <= 0:
+                    continue  # position size can't buy even one share -> skip this entry only
+                if cash < invested:
+                    skipped_insufficient_cash += 1
+                    continue  # insufficient cash -> skip this entry only
                 cash -= invested
                 stop_price = today_open * (1 - stop_loss_pct / 100.0) if enable_stop_loss else None
                 target_price = today_open * (1 + target_pct / 100.0) if enable_target else None
@@ -477,11 +494,20 @@ def run_portfolio_backtest(
 
     trades_df = pd.DataFrame(trades)
     equity_df = pd.DataFrame(equity_records)
+    highest_concurrent = int(max(concurrent_counts)) if concurrent_counts else 0
+    avg_concurrent = float(np.mean(concurrent_counts)) if concurrent_counts else 0.0
+    slot_utilization_pct = (
+        (avg_concurrent / max_concurrent_positions) * 100 if max_concurrent_positions else 0.0
+    )
     portfolio_stats = {
-        'max_concurrent_positions': int(max(concurrent_counts)) if concurrent_counts else 0,
-        'avg_concurrent_positions': float(np.mean(concurrent_counts)) if concurrent_counts else 0.0,
+        'max_concurrent_positions_setting': int(max_concurrent_positions),
+        'highest_concurrent_positions': highest_concurrent,
+        'avg_concurrent_positions': avg_concurrent,
         'peak_capital_invested': float(max(invested_amounts_daily)) if invested_amounts_daily else 0.0,
         'avg_capital_invested': float(np.mean(invested_amounts_daily)) if invested_amounts_daily else 0.0,
+        'position_slot_utilization_pct': float(slot_utilization_pct),
+        'skipped_position_limit': int(skipped_position_limit),
+        'skipped_insufficient_cash': int(skipped_insufficient_cash),
     }
     return trades_df, equity_df, float(cash), portfolio_stats
 
@@ -494,20 +520,28 @@ def compute_backtest_summary(
 ) -> dict:
     """Compute backtest summary statistics from trades and daily equity curve."""
     portfolio_stats = portfolio_stats or {
-        'max_concurrent_positions': 0,
+        'max_concurrent_positions_setting': 0,
+        'highest_concurrent_positions': 0,
         'avg_concurrent_positions': 0.0,
         'peak_capital_invested': 0.0,
         'avg_capital_invested': 0.0,
+        'position_slot_utilization_pct': 0.0,
+        'skipped_position_limit': 0,
+        'skipped_insufficient_cash': 0,
     }
     capital_utilization_pct = (
         (portfolio_stats['avg_capital_invested'] / initial_capital) * 100 if initial_capital else 0.0
     )
     concurrency_fields = {
-        'Maximum Concurrent Positions': int(portfolio_stats['max_concurrent_positions']),
+        'Maximum Concurrent Positions (User Setting)': int(portfolio_stats['max_concurrent_positions_setting']),
+        'Highest Concurrent Positions Reached': int(portfolio_stats['highest_concurrent_positions']),
         'Average Concurrent Positions': round(float(portfolio_stats['avg_concurrent_positions']), 2),
+        'Position Slot Utilization (%)': round(float(portfolio_stats['position_slot_utilization_pct']), 2),
         'Peak Capital Invested': round(float(portfolio_stats['peak_capital_invested']), 2),
         'Average Capital Invested': round(float(portfolio_stats['avg_capital_invested']), 2),
         'Capital Utilization %': round(float(capital_utilization_pct), 2),
+        'Trades Skipped Due to Position Limit': int(portfolio_stats['skipped_position_limit']),
+        'Trades Skipped Due to Insufficient Cash': int(portfolio_stats['skipped_insufficient_cash']),
     }
 
     if trades_df.empty:
@@ -982,6 +1016,13 @@ def main():
         target_pct = st.slider('Target %', min_value=1.0, max_value=50.0, value=10.0, step=0.5,
                                 disabled=not enable_target)
 
+        st.subheader('Portfolio Sizing')
+        max_concurrent_positions = st.number_input(
+            'Maximum Concurrent Positions',
+            min_value=1, max_value=500, value=10, step=1,
+            help='The backtester will never hold more than this many open trades at once, across all symbols.',
+        )
+
         st.subheader('Stock Universe')
         universe_choice = st.radio(
             'Select universe',
@@ -1135,6 +1176,7 @@ def main():
         symbol_data, initial_capital, position_size,
         enable_stop_loss=enable_stop_loss, stop_loss_pct=stop_loss_pct,
         enable_target=enable_target, target_pct=target_pct,
+        max_concurrent_positions=max_concurrent_positions,
     )
     if combined_equity.empty:
         combined_equity = pd.DataFrame({'date': [pd.Timestamp(start_date)], 'equity': [float(initial_capital)]})
