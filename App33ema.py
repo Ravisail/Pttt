@@ -33,6 +33,7 @@ from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 import yfinance as yf
 
@@ -335,7 +336,16 @@ def to_nse_ticker(symbol: str) -> str:
 @st.cache_data(show_spinner=False, ttl=3600)
 def fetch_history(symbol: str, start: str, end: str) -> pd.DataFrame:
     ticker = to_nse_ticker(symbol)
-    df = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=False, threads=False)
+    df = None
+    for attempt in range(3):  # retry transient yfinance/network failures
+        try:
+            df = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=False, threads=False)
+            if df is not None and not df.empty:
+                break
+        except Exception:
+            df = None
+        import time as _t
+        _t.sleep(0.5 * (attempt + 1))
     if df is None or df.empty:
         return pd.DataFrame()
     if isinstance(df.columns, pd.MultiIndex):
@@ -429,6 +439,8 @@ class Trade:
     exit_date: pd.Timestamp | None = None
     exit_price: float | None = None
     qty: float = 0.0
+    entry_fee: float = 0.0
+    exit_fee: float = 0.0
 
 
 def build_symbol_signal_frames(symbols: list[str], start_date: date, end_date: date, params: dict) -> dict:
@@ -509,7 +521,9 @@ def run_backtest(symbols: list[str], start_date: date, end_date: date, params: d
         return {"trades": pd.DataFrame(), "equity_curve": pd.DataFrame(), "metrics": metrics, "status": status}
 
     events_df = pd.DataFrame(events, columns=["exec_date", "symbol", "action", "price"])
-    events_df = events_df.sort_values(["exec_date", "action", "symbol"])  # SELL < BUY alphabetically -> exits first
+    events_df = events_df.sort_values(["exec_date", "action", "symbol"])
+    # NOTE: "BUY" sorts before "SELL" alphabetically — execution order is enforced
+    # explicitly below (SELL block runs before BUY block), NOT by this sort.
     all_dates = sorted(set(events_df["exec_date"]).union(
         *[set(p.index[(p.index.date >= start_date) & (p.index.date <= end_date)]) for p in price_panel.values()]
     ))
@@ -550,6 +564,7 @@ def run_backtest(symbols: list[str], start_date: date, end_date: date, params: d
                 cash += gross - fee
                 t.exit_date = d_
                 t.exit_price = exit_price
+                t.exit_fee = fee
                 closed_trades.append(t)
 
             # 2) process BUY (entries), respecting max open positions & cash
@@ -577,8 +592,8 @@ def run_backtest(symbols: list[str], start_date: date, end_date: date, params: d
                 usable = alloc - fee_buffer
                 if usable <= 0:
                     continue
-                qty = usable / entry_price
-                if qty <= 0:
+                qty = float(math.floor(usable / entry_price))  # NSE = whole shares only
+                if qty < 1:
                     continue
                 cost = qty * entry_price
                 fee = cost * (brokerage_pct / 100.0)
@@ -586,7 +601,8 @@ def run_backtest(symbols: list[str], start_date: date, end_date: date, params: d
                 if total_cost > cash:
                     continue
                 cash -= total_cost
-                open_positions[sym] = Trade(symbol=sym, entry_date=d_, entry_price=entry_price, qty=qty)
+                open_positions[sym] = Trade(symbol=sym, entry_date=d_, entry_price=entry_price,
+                                            qty=qty, entry_fee=fee)
 
         equity_curve.append({"date": d_, "equity": mark_to_market(d_)})
 
@@ -603,7 +619,7 @@ def run_backtest(symbols: list[str], start_date: date, end_date: date, params: d
         cash += gross - fee
         t.exit_date = last_date
         t.exit_price = exit_price
-        t.qty = t.qty
+        t.exit_fee = fee
         closed_trades.append(t)
     open_positions.clear()
 
@@ -618,8 +634,9 @@ def run_backtest(symbols: list[str], start_date: date, end_date: date, params: d
         if entry_price is None or exit_price is None or not np.isfinite(entry_price) or entry_price <= 0:
             skipped_invalid_entry += 1
             continue
-        pnl_pct = (exit_price / entry_price - 1) * 100.0
-        pnl_inr = (exit_price - entry_price) * t.qty
+        invested = entry_price * t.qty + t.entry_fee
+        pnl_inr = (exit_price - entry_price) * t.qty - t.entry_fee - t.exit_fee
+        pnl_pct = (pnl_inr / invested * 100.0) if invested > 0 else 0.0
         holding_days = (t.exit_date - t.entry_date).days if t.exit_date is not None else None
         trade_rows.append({
             "Symbol": t.symbol,
@@ -719,6 +736,54 @@ def parse_symbol_text(text: str) -> list[str]:
 
 
 # ============================================================================
+# NSE INDEX UNIVERSES (NIFTY 50 / 200 / 500)
+# ============================================================================
+
+INDEX_URLS = {
+    "NIFTY 50": "https://archives.nseindia.com/content/indices/ind_nifty50list.csv",
+    "NIFTY 200": "https://archives.nseindia.com/content/indices/ind_nifty200list.csv",
+    "NIFTY 500": "https://archives.nseindia.com/content/indices/ind_nifty500list.csv",
+}
+
+NIFTY50_FALLBACK = [
+    "ADANIENT", "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT", "AXISBANK",
+    "BAJAJ-AUTO", "BAJFINANCE", "BAJAJFINSV", "BEL", "BHARTIARTL",
+    "CIPLA", "COALINDIA", "DRREDDY", "EICHERMOT", "ETERNAL",
+    "GRASIM", "HCLTECH", "HDFCBANK", "HDFCLIFE", "HEROMOTOCO",
+    "HINDALCO", "HINDUNILVR", "ICICIBANK", "INDUSINDBK", "INFY",
+    "ITC", "JIOFIN", "JSWSTEEL", "KOTAKBANK", "LT",
+    "M&M", "MARUTI", "NESTLEIND", "NTPC", "ONGC",
+    "POWERGRID", "RELIANCE", "SBILIFE", "SBIN", "SHRIRAMFIN",
+    "SUNPHARMA", "TATACONSUM", "TATAMOTORS", "TATASTEEL", "TCS",
+    "TECHM", "TITAN", "TRENT", "ULTRACEMCO", "WIPRO",
+]
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def fetch_index_symbols(index_name: str) -> list[str]:
+    """Download NSE index constituents; falls back to a static NIFTY 50
+    list when the NSE archive is unreachable."""
+    url = INDEX_URLS[index_name]
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    for attempt in range(3):
+        try:
+            resp = requests.get(url, headers=headers, timeout=20)
+            resp.raise_for_status()
+            df = pd.read_csv(io.StringIO(resp.text))
+            col = "Symbol" if "Symbol" in df.columns else df.columns[0]
+            syms = (df[col].dropna().astype(str).str.strip().str.upper().tolist())
+            syms = [s for s in syms if s]
+            if syms:
+                return syms
+        except Exception:
+            import time as _t
+            _t.sleep(1.0 * (attempt + 1))
+    st.sidebar.warning(f"Could not fetch {index_name} list from NSE — "
+                       "using built-in NIFTY 50 fallback.")
+    return list(NIFTY50_FALLBACK)
+
+
+# ============================================================================
 # STREAMLIT UI
 # ============================================================================
 
@@ -757,9 +822,15 @@ def sidebar_inputs():
     )
 
     st.sidebar.header("📋 Symbol List")
-    input_mode = st.sidebar.radio("Input Method", ["Manual Entry", "Upload CSV/Excel"], horizontal=True)
+    input_mode = st.sidebar.radio("Input Method",
+                                  ["NSE Index", "Manual Entry", "Upload CSV/Excel"],
+                                  horizontal=True)
     symbols: list[str] = []
-    if input_mode == "Manual Entry":
+    if input_mode == "NSE Index":
+        index_name = st.sidebar.selectbox("Index", list(INDEX_URLS.keys()))
+        symbols = fetch_index_symbols(index_name)
+        st.sidebar.caption(f"{len(symbols)} symbols loaded from {index_name}.")
+    elif input_mode == "Manual Entry":
         text = st.sidebar.text_area("Symbols (comma or newline separated)",
                                      value="RELIANCE\nTCS\nINFY\nHDFCBANK\nICICIBANK")
         symbols = parse_symbol_text(text)
@@ -866,6 +937,8 @@ def render_backtest_tab(cfg):
 
 
 def main():
+    st.set_page_config(page_title="NSE Scanner Pro — VWAP + EMA Channel",
+                       page_icon="📈", layout="wide")
     st.title("📈 NSE Scanner Pro — Dynamic Swing VWAP + EMA Channel Key K-Lines")
     st.caption(
         "Long-only strategy combining Zeiierman's Dynamic Swing Anchored VWAP (trend filter) "
